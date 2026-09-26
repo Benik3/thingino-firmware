@@ -1,0 +1,645 @@
+From: Benik3 <benik333@gmail.com>
+Date: Sat, 26 Sep 2026 15:46:32 +0200
+Subject: [PATCH] sdupdate: verify the image before and after flashing
+
+sdupdate erased the flash and wrote whatever fatload left in RAM, then
+created the .done flag. No step was checked. A bad SD read, a corrupt
+image or a failed program all left a flash that does not boot, and the
+flag stopped any retry. An autoupdate-uboot.bin larger than the 256K it
+erases was also written past the erased area.
+
+A clean file on the PC does not prove the copy U-Boot read, and jz_mmc
+could report a read with a CRC error as good (fixed separately).
+
+The full, u-boot-only and custom-file updates now:
+- read the file until it matches <file>.sha256sum when that file is on
+  the card, otherwise until two reads give the same CRC32, at most 3
+  reads, with an mmc rescan after a failed read because it can leave
+  the card mid-transfer. The build already writes
+  thingino-<camera>.bin.sha256sum next to the image
+  (generate_release_artifacts.sh, run by pack); its # comment lines are
+  skipped;
+- refuse an empty image and one larger than its area: the whole chip
+  for a full image, UBOOT_SIZE for autoupdate-uboot.bin;
+- refuse an image whose u-boot uImage (after the SPL, at
+  CONFIG_UBOOT_OFFSET) or kernel uImage (on a 64K boundary from 0x40000)
+  fails its data CRC, or whose u-boot is larger than
+  CONFIG_SYS_MONITOR_LEN. That is all the SPL loads: spl_sfc_nor.c
+  parses the header at memory address CONFIG_UBOOT_OFFSET instead of
+  the copy in flash, so spl_parse_image_header normally finds no magic
+  and falls back to that size;
+- after erasing the area and writing, read the flash back in 64K chunks
+  and rewrite only the chunks that differ, for up to 5 rounds, from the
+  verified image still in RAM;
+- keep rewriting the bootloader area (the first 320K) until it
+  verifies, because the camera does not start again without it;
+  Ctrl-C on the console stops this;
+- write each step and the result to sdupdate.log on the card, one log
+  per sdupdate run.
+
+Nothing is erased when a check before the erase fails, and the .done
+flags are written only after a verified flash. When only chunks
+outside the bootloader area still differ, the update fails without
+.done, and the next boot, from a good bootloader, retries it. A failed
+erase falls back to rewriting chunk by chunk, which also recovers from
+an erase the chip ignored. The CRC of the image in RAM is checked again
+before the result is accepted.
+
+CONFIG_SHA256 builds lib/sha256.c, which U-Boot already carries. It is
+left out of the T31LC and XIAOMI_SPL builds, which drop other features
+for size and load a fixed CONFIG_SYS_MONITOR_LEN of raw u-boot; there a
+.sha256sum on the card is ignored with a note and the two reads decide.
+
+The write command takes the size of the verified read instead of
+${filesize}, which loading <file>.sha256sum overwrites. The log has a
+fixed 8.3 name because fatwrite takes the short name from the first
+dot, so <file>.log would share its short name with <file>.
+
+Signed-off-by: Benik3 <benik333@gmail.com>
+---
+ common/cmd_sdupdate.c         | 501 ++++++++++++++++++++++++++++++++++++++++++--------
+ include/configs/isvp_common.h |   3 +
+ 2 files changed, 426 insertions(+), 78 deletions(-)
+
+diff --git a/common/cmd_sdupdate.c b/common/cmd_sdupdate.c
+--- a/common/cmd_sdupdate.c
++++ b/common/cmd_sdupdate.c
+@@ -4,14 +4,30 @@
+ #include <common.h>
+ #include <command.h>
+ #include <environment.h>
++#include <image.h>
++#include <malloc.h>
++#include <sha256.h>
++#include <spi_flash.h>
+ 
+ #define UBOOT_SIZE          0x40000   /* 256KB - this one we keep fixed */
+ 
+ #define AU_UBOOT    "autoupdate-uboot.bin"
+ #define AU_FW       "autoupdate-full.bin"
++#define AU_LOG      "sdupdate.log"
++
++#define SDU_LOAD_TRIES		3
++#define SDU_REPAIR_ROUNDS	5
++#define SDU_BOOT_SIZE		0x50000	/* boot partition, U_BOOT_SIZE_KB */
++#define SDU_CHUNK		0x10000
++#define SDU_SUM_FILE_MAX	0x200
++#define SDU_KERNEL_SCAN_START	0x40000
++#define SDU_KERNEL_SCAN_END	0x200000
+ 
+ int autoupdate_status = -1;
+ 
++static char sdu_log[1024];
++static int sdu_log_len;
++
+ static int check_env_vars(void)
+ {
+ 	if (!getenv("flash_len")) {
+@@ -25,6 +41,403 @@
+ 	return 0;
+ }
+ 
++static void sdu_note(const char *fmt, ...)
++	__attribute__ ((format (__printf__, 1, 2)));
++
++/* Print a result line and keep it for AU_LOG */
++static void sdu_note(const char *fmt, ...)
++{
++	char line[160];
++	va_list args;
++	int n;
++
++	va_start(args, fmt);
++	n = vsprintf(line, fmt, args);
++	va_end(args);
++
++	printf("SDU:   %s\n", line);
++	if (n > 0 && sdu_log_len + n + 1 <= (int)sizeof(sdu_log)) {
++		memcpy(sdu_log + sdu_log_len, line, n);
++		sdu_log_len += n;
++		sdu_log[sdu_log_len++] = '\n';
++	}
++}
++
++static void sdu_log_save(void)
++{
++	char cmd[128];
++
++	sprintf(cmd, "fatwrite mmc 0:1 %lx " AU_LOG " %x",
++		(ulong)sdu_log, sdu_log_len);
++	if (run_command(cmd, 0) != 0)
++		printf("SDU:   Warning: Failed to write " AU_LOG "\n");
++}
++
++#ifdef CONFIG_SHA256
++static int sdu_hex(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F')
++		return c - 'A' + 10;
++	return -1;
++}
++
++/* The first line that is not a # comment starts with 64 hex digits */
++static int sdu_parse_sha(const char *s, uchar *digest)
++{
++	int i, hi, lo;
++
++	for (;;) {
++		while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
++			s++;
++		if (*s != '#')
++			break;
++		while (*s && *s != '\n')
++			s++;
++	}
++	for (i = 0; i < SHA256_SUM_LEN; i++) {
++		hi = sdu_hex(*s++);
++		if (hi < 0)
++			return -1;
++		lo = sdu_hex(*s++);
++		if (lo < 0)
++			return -1;
++		digest[i] = hi << 4 | lo;
++	}
++	return sdu_hex(*s) < 0 ? 0 : -1;
++}
++#endif
++
++/* 1: digest taken from <file>.sha256sum, 0: no such file, -1: unusable */
++static int sdu_expected_sha(const char *file, uchar *digest)
++{
++	ALLOC_CACHE_ALIGN_BUFFER(char, buf, SDU_SUM_FILE_MAX + 1);
++	char cmd[128];
++
++	memset(buf, 0, SDU_SUM_FILE_MAX + 1);
++	sprintf(cmd, "fatload mmc 0:1 %lx %.64s.sha256sum %x",
++		(ulong)buf, file, SDU_SUM_FILE_MAX);
++	if (run_command(cmd, 0) != 0)
++		return 0;
++#ifdef CONFIG_SHA256
++	return sdu_parse_sha(buf, digest) ? -1 : 1;
++#else
++	sdu_note("%.64s.sha256sum not checked, no sha256 in this build", file);
++	return 0;
++#endif
++}
++
++static int sdu_sha_matches(const uchar *img, ulong size, const uchar *digest)
++{
++#ifdef CONFIG_SHA256
++	uchar sum[SHA256_SUM_LEN];
++
++	sha256_csum_wd(img, size, sum, CHUNKSZ_SHA256);
++	return !memcmp(sum, digest, SHA256_SUM_LEN);
++#else
++	return 0;
++#endif
++}
++
++/*
++ * Read the file until a read matches the expected sha256 or, without one,
++ * until two reads agree.
++ */
++static int sdu_load(const char *file, const uchar *digest, ulong *size,
++		    u32 *crc)
++{
++	const char *loadaddr = getenv("loadaddr");
++	const uchar *img = (const uchar *)simple_strtoul(loadaddr, NULL, 16);
++	char cmd[128];
++	ulong sz, prev_sz = 0;
++	u32 c, prev = 0;
++	int i, ok, have_prev = 0;
++
++	for (i = 1; i <= SDU_LOAD_TRIES; i++) {
++		sprintf(cmd, "fatload mmc 0:1 %s %.64s", loadaddr, file);
++		if (run_command(cmd, 0) != 0) {
++			sdu_note("read %d: failed", i);
++			/* a failed read can leave the card mid-transfer */
++			run_command("mmc rescan", 0);
++			continue;
++		}
++		sz = getenv_ulong("filesize", 16, 0);
++		c = crc32(0, img, sz);
++		if (digest) {
++			ok = sdu_sha_matches(img, sz, digest);
++			sdu_note("read %d: %lu bytes, crc32 %08x, sha256 %s",
++				 i, sz, c, ok ? "matches" : "differs");
++		} else {
++			ok = have_prev && c == prev && sz == prev_sz;
++			sdu_note("read %d: %lu bytes, crc32 %08x", i, sz, c);
++		}
++		if (ok) {
++			*size = sz;
++			*crc = c;
++			return 0;
++		}
++		prev = c;
++		prev_sz = sz;
++		have_prev = 1;
++	}
++	return -1;
++}
++
++/* 1: a valid uImage at off, 0: none there, -1: valid header, bad data */
++static int sdu_uimage_at(const uchar *img, ulong size, ulong off)
++{
++	const image_header_t *hdr = (const image_header_t *)(img + off);
++
++	if (off + image_get_header_size() > size ||
++	    !image_check_magic(hdr) || !image_check_hcrc(hdr))
++		return 0;
++	if (image_get_image_size(hdr) > size - off || !image_check_dcrc(hdr))
++		return -1;
++	return 1;
++}
++
++/*
++ * The LZO bootloader carries its u-boot as a uImage right after the SPL,
++ * and the SPL loads CONFIG_SYS_MONITOR_LEN of it whatever the header says.
++ * A full image also carries the kernel as a uImage on a 64K boundary.
++ */
++static int sdu_check_image(const uchar *img, ulong size)
++{
++	const image_header_t *hdr;
++	ulong off;
++	int r;
++
++	r = sdu_uimage_at(img, size, CONFIG_UBOOT_OFFSET);
++	if (r < 0) {
++		sdu_note("u-boot @0x%x: bad data crc", CONFIG_UBOOT_OFFSET);
++		return -1;
++	}
++	if (r > 0) {
++		hdr = (const image_header_t *)(img + CONFIG_UBOOT_OFFSET);
++		if (image_get_image_size(hdr) > CONFIG_SYS_MONITOR_LEN) {
++			sdu_note("u-boot @0x%x: %u bytes, the SPL loads only %u",
++				 CONFIG_UBOOT_OFFSET, image_get_image_size(hdr),
++				 CONFIG_SYS_MONITOR_LEN);
++			return -1;
++		}
++		sdu_note("u-boot @0x%x: crc ok", CONFIG_UBOOT_OFFSET);
++	} else {
++		sdu_note("u-boot: no uImage header, not checked");
++	}
++
++	if (size <= SDU_KERNEL_SCAN_START)
++		return 0;
++	for (off = SDU_KERNEL_SCAN_START; off < SDU_KERNEL_SCAN_END;
++	     off += 0x10000) {
++		r = sdu_uimage_at(img, size, off);
++		if (!r)
++			continue;
++		if (r < 0) {
++			sdu_note("kernel @0x%lx: bad data crc", off);
++			return -1;
++		}
++		sdu_note("kernel @0x%lx: crc ok", off);
++		return 0;
++	}
++	sdu_note("kernel: no uImage found, not checked");
++	return 0;
++}
++
++#ifdef CONFIG_CMD_SF
++extern struct spi_flash *get_flash(void);
++
++/* A second read tells a flaky read from a bad write */
++static int sdu_chunk_ok(struct spi_flash *flash, uchar *buf, const uchar *img,
++			ulong off, ulong n, int *reread)
++{
++	if (!spi_flash_read(flash, off, (n + 3) & ~3, buf) &&
++	    !memcmp(buf, img + off, n))
++		return 1;
++	if (!spi_flash_read(flash, off, (n + 3) & ~3, buf) &&
++	    !memcmp(buf, img + off, n)) {
++		(*reread)++;
++		return 1;
++	}
++	return 0;
++}
++
++static void sdu_rewrite(ulong addr, ulong off, ulong n)
++{
++	char cmd[128];
++
++	sprintf(cmd, "sf erase 0x%lx 0x%x", off, SDU_CHUNK);
++	if (run_command(cmd, 0) != 0)
++		return;
++	sprintf(cmd, "sf write %lx 0x%lx 0x%lx", addr + off, off, n);
++	run_command(cmd, 0);
++}
++
++/*
++ * Compare [0, end) of the flash with the image and, with repair set,
++ * rewrite every chunk that differs. Returns the number of differing
++ * chunks; *first is the first differing byte, *boot the number of
++ * differing chunks in the bootloader area.
++ */
++static int sdu_scan(struct spi_flash *flash, uchar *buf, ulong addr, ulong end,
++		    int repair, ulong *first, int *boot, int *reread)
++{
++	const uchar *img = (const uchar *)addr;
++	ulong off, n, i;
++	int bad = 0;
++
++	*boot = 0;
++	for (off = 0; off < end; off += SDU_CHUNK) {
++		n = end - off < SDU_CHUNK ? end - off : SDU_CHUNK;
++		if (sdu_chunk_ok(flash, buf, img, off, n, reread))
++			continue;
++		if (!bad++) {
++			for (i = 0; i < n && buf[i] == img[off + i]; i++)
++				;
++			*first = off + i;
++		}
++		if (off < SDU_BOOT_SIZE)
++			(*boot)++;
++		if (repair)
++			sdu_rewrite(addr, off, n);
++	}
++	return bad;
++}
++
++/*
++ * Erase [0, area), write the image and read it back until the flash holds
++ * it. area is the whole chip for a full image and UBOOT_SIZE for u-boot.
++ */
++static int sdu_write_verified(ulong addr, ulong size, ulong area, u32 crc)
++{
++	struct spi_flash *flash = get_flash();
++	uchar *buf = malloc(SDU_CHUNK);
++	ulong boot_end = size < SDU_BOOT_SIZE ? size : SDU_BOOT_SIZE;
++	ulong first = 0;
++	char cmd[128];
++	int round, repair, bad, boot, reread = 0, ret = -1;
++
++	if (!flash || !buf) {
++		sdu_note("FAILED: cannot read the flash back");
++		goto out;
++	}
++
++	sprintf(cmd, "sf erase 0x0 0x%lx", area);
++	if (run_command(cmd, 0) != 0) {
++		sdu_note("erase failed, rewriting chunk by chunk");
++	} else {
++		sprintf(cmd, "sf write %lx 0x0 0x%lx", addr, size);
++		if (run_command(cmd, 0) != 0)
++			sdu_note("write failed, rewriting chunk by chunk");
++	}
++
++	for (round = 1; ; round++) {
++		repair = round <= SDU_REPAIR_ROUNDS;
++		bad = sdu_scan(flash, buf, addr, size, repair, &first, &boot,
++			       &reread);
++		if (!bad || !repair)
++			break;
++		sdu_note("verify %d: %d chunk(s) differ, first at 0x%lx,"
++			 " rewritten", round, bad, first);
++	}
++
++	/* with a bad bootloader the camera does not come up again */
++	if (bad && boot) {
++		sdu_note("bootloader area differs, rewriting it until it"
++			 " verifies (Ctrl-C stops)");
++		sdu_log_save();
++		while (sdu_scan(flash, buf, addr, boot_end, 1, &first, &boot,
++				&reread)) {
++			if (ctrlc()) {
++				sdu_note("FAILED: stopped with the bootloader"
++					 " area not matching, do not power off");
++				goto out;
++			}
++		}
++		bad = sdu_scan(flash, buf, addr, size, 0, &first, &boot,
++			       &reread);
++	}
++
++	if (reread)
++		sdu_note("verify: %d chunk read(s) matched only on a second"
++			 " read", reread);
++	if (crc32(0, (const uchar *)addr, size) != crc)
++		sdu_note("FAILED: the image in RAM changed while flashing");
++	else if (bad)
++		sdu_note("FAILED: %d chunk(s) still differ, first at 0x%lx;"
++			 " bootloader area verified, the next boot retries",
++			 bad, first);
++	else
++		ret = 1;
++out:
++	free(buf);
++	return ret;
++}
++#else
++static int sdu_write_verified(ulong addr, ulong size, ulong area, u32 crc)
++{
++	sdu_note("FAILED: no sf command");
++	return -1;
++}
++#endif
++
++/*
++ * Load, check, erase, write and read back an image that must fit
++ * [0, area): 1 on success, -1 on failure.
++ */
++static int sdu_flash_file(const char *file, ulong area)
++{
++	ulong addr = simple_strtoul(getenv("loadaddr"), NULL, 16);
++	uchar digest[SHA256_SUM_LEN];
++	char hex[2 * SHA256_SUM_LEN + 1];
++	ulong size;
++	u32 crc;
++	int have_sha, i;
++
++	sdu_note("file %.64s", file);
++
++	have_sha = sdu_expected_sha(file, digest);
++	if (have_sha < 0) {
++		sdu_note("FAILED: %.64s.sha256sum has no sha256 line,"
++			 " flash not touched", file);
++		goto out;
++	}
++	if (have_sha) {
++		for (i = 0; i < SHA256_SUM_LEN; i++)
++			sprintf(hex + 2 * i, "%02x", digest[i]);
++		sdu_note("expected sha256 %s", hex);
++	}
++
++	if (sdu_load(file, have_sha ? digest : NULL, &size, &crc)) {
++		if (have_sha)
++			sdu_note("FAILED: no read matches %.64s.sha256sum,"
++				 " flash not touched", file);
++		else
++			sdu_note("FAILED: reads disagree, flash not touched");
++		goto out;
++	}
++	if (size == 0 || size > area) {
++		sdu_note("FAILED: %lu bytes, the limit is %lu, flash not"
++			 " touched", size, area);
++		goto out;
++	}
++	if (sdu_check_image((const uchar *)addr, size)) {
++		sdu_note("FAILED: image check failed, flash not touched");
++		goto out;
++	}
++
++	if (sdu_write_verified(addr, size, area, crc) < 0)
++		goto out;
++	sdu_note("OK: flashed and verified, crc32 %08x", crc);
++	sdu_log_save();
++	return 1;
++out:
++	sdu_log_save();
++	return -1;
++}
++
+ static int do_flash_uboot(void)
+ {
+ 	char cmd[128];
+@@ -48,32 +461,8 @@
+ 		return 0;
+ 	}
+ 
+-	printf("SDU:   Loading u-boot update file...\n");
+-	sprintf(cmd, "fatload mmc 0:1 %s %s", loadaddr, AU_UBOOT);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Failed to load %s\n", AU_UBOOT);
+-		return -1;
+-	}
+-
+-	printf("SDU:   Erasing u-boot section in flash...\n");
+-	sprintf(cmd, "sf erase 0x0 0x%x", UBOOT_SIZE);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash erase failed\n");
+-		return -1;
+-	}
+-
+-	printf("SDU:   Writing new u-boot to flash...\n");
+-	sprintf(cmd, "sf write %s 0x0 ${filesize}", loadaddr);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash write failed\n");
++	if (sdu_flash_file(AU_UBOOT, UBOOT_SIZE) < 0)
+ 		return -1;
+-	}
+ 
+ 	printf("SDU:   Creating u-boot update flag file...\n");
+ 	sprintf(cmd, "fatwrite mmc 0:1 %s autoupdate-uboot.done 1", loadaddr);
+@@ -114,32 +503,8 @@
+ 		return 0;
+ 	}
+ 
+-	printf("SDU:   Loading full update file...\n");
+-	sprintf(cmd, "fatload mmc 0:1 %s %s", loadaddr, AU_FW);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Failed to load %s\n", AU_FW);
+-		return -1;
+-	}
+-
+-	printf("SDU:   Erasing flash chip...\n");
+-	sprintf(cmd, "sf erase 0x0 0x%lx", flash_size);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash chip erase failed\n");
+-		return -1;
+-	}
+-
+-	printf("SDU:   Writing full image to flash...\n");
+-	sprintf(cmd, "sf write %s 0x0 ${filesize}", loadaddr);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash write failed\n");
++	if (sdu_flash_file(AU_FW, flash_size) < 0)
+ 		return -1;
+-	}
+ 
+ 	printf("SDU:   Creating full update flag file...\n");
+ 	sprintf(cmd, "fatwrite mmc 0:1 %s autoupdate-full.done 1", loadaddr);
+@@ -164,8 +529,8 @@
+ 	/* Convert flash_len from hex string to number */
+ 	flash_size = simple_strtoul(flash_len, NULL, 16);
+ 
+-	printf("SDU:   Checking for custom update file %s...\n", filename);
+-	sprintf(cmd, "fatload mmc 0:1 %s %s 1", loadaddr, filename);
++	printf("SDU:   Checking for custom update file %.64s...\n", filename);
++	sprintf(cmd, "fatload mmc 0:1 %s %.64s 1", loadaddr, filename);
+ 	debug("SDU:   Running command: %s\n", cmd);
+ 	ret = run_command(cmd, 0);
+ 	if (ret != 0) {
+@@ -173,32 +538,8 @@
+ 		return 0;
+ 	}
+ 
+-	printf("SDU:   Loading custom update file...\n");
+-	sprintf(cmd, "fatload mmc 0:1 %s %s", loadaddr, filename);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Failed to load %s\n", filename);
+-		return -1;
+-	}
+-
+-	printf("SDU:   Erasing entire flash...\n");
+-	sprintf(cmd, "sf erase 0x0 0x%lx", flash_size);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash erase failed\n");
+-		return -1;
+-	}
+-
+-	printf("SDU:   Writing image to flash...\n");
+-	sprintf(cmd, "sf write %s 0x0 ${filesize}", loadaddr);
+-	debug("SDU:   Running command: %s\n", cmd);
+-	ret = run_command(cmd, 0);
+-	if (ret != 0) {
+-		printf("SDU:   Error: Flash write failed\n");
++	if (sdu_flash_file(filename, flash_size) < 0)
+ 		return -1;
+-	}
+ 
+ 	printf("SDU:   Successfully flashed custom image\n");
+ 	return 1;
+@@ -219,6 +560,9 @@
+ 		return CMD_RET_FAILURE;
+ 	}
+ 
++	/* one log per run, so a u-boot and a full update both show */
++	sdu_log_len = 0;
++
+ 	if (argc > 1) {
+ 		/* If argument is a number, treat as type */
+ 		if (argv[1][0] >= '0' && argv[1][0] <= '9') {
+@@ -260,5 +604,6 @@
+ 	"  sdupdate         - Try both autoupdate-uboot.bin and autoupdate-full.bin\n"
+ 	"  sdupdate 0       - Use autoupdate-uboot.bin only\n"
+ 	"  sdupdate 1       - Use autoupdate-full.bin only\n"
+-	"  sdupdate file.bin - Flash custom image file.bin"
++	"  sdupdate file.bin - Flash custom image file.bin\n"
++	"The image must match <file>.sha256sum if present; the result goes to " AU_LOG
+ );
+diff --git a/include/configs/isvp_common.h b/include/configs/isvp_common.h
+--- a/include/configs/isvp_common.h
++++ b/include/configs/isvp_common.h
+@@ -714,6 +714,9 @@
+ #define CONFIG_RANDOM_MACADDR
+ 
+ #define CONFIG_AUTO_UPDATE
++#if !defined(CONFIG_T31LC) && !defined(CONFIG_XIAOMI_SPL)
++#define CONFIG_SHA256		/* sdupdate checks <file>.sha256sum */
++#endif
+ 
+ /**
+  * Command configuration.
