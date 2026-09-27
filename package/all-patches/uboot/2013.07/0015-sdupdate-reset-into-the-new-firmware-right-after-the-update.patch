@@ -1,0 +1,64 @@
+From: Benik3 <benik333@gmail.com>
+Date: Sun, 27 Sep 2026 01:53:59 +0200
+Subject: [PATCH] sdupdate: reset into the new firmware right after the
+ update
+
+After a successful full update, board_init_r carried on with the
+u-boot and environment still in RAM: it ran sdstart and boot.scr and
+imported uEnv.txt with saveenv, and only then reset. That saveenv wrote
+the old firmware's environment, with its mtdparts, kern_size and
+data_addr, over the environment the new image had just put in flash.
+When the new rootfs is larger, the kernel then gets a rootfs partition
+that is too short and a data partition that starts inside the new
+rootfs, and JFFS2 erases that part.
+
+Reset as soon as sdupdate reports a verified update, before anything
+else runs, so the new u-boot applies uEnv.txt to its own environment on
+the next boot. A bootloader-only update resets as well: the u-boot
+running from RAM is the old one, and its saveenv writes to the old
+CONFIG_ENV_OFFSET.
+
+Signed-off-by: Benik3 <benik333@gmail.com>
+---
+ arch/mips/lib/board.c | 10 +++++-----
+ common/cmd_sdupdate.c |  1 +
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/arch/mips/lib/board.c b/arch/mips/lib/board.c
+--- a/arch/mips/lib/board.c
++++ b/arch/mips/lib/board.c
+@@ -418,6 +418,11 @@
+ 		/* The environment variable 'disable_sd' exists and its value is "false" */
+ 		#ifdef CONFIG_AUTO_UPDATE
+ 			run_command("sf probe-alt;sdupdate",0);
++			/* the u-boot and env in RAM no longer match the flash */
++			if (autoupdate_status > 0) {
++				printf("SDU:   Update verified, resetting into it...\n");
++				do_reset(NULL, 0, 0, NULL);
++			}
+ 		#endif
+ 		#ifdef CONFIG_CMD_SDSTART
+ 			run_command("sdstart",0);
+@@ -435,11 +440,6 @@
+ 			run_command(ENV_FILE, 0);
+ 			run_command("env import -t -r ${loadaddr} ${filesize};setenv filesize;saveenv;", 0);
+ 		}
+-
+-		if (autoupdate_status == 3) {
+-			printf("MMC:   Auto-update is set to 'full'. Reset to updated firmware...\n");
+-			do_reset(NULL, 0, 0, NULL);
+-		}
+ 	} else {
+ 			/* 'disable_sd' does not exist or is not "true" */
+ 			printf("MMC:   SD card disabled\n");
+diff --git a/common/cmd_sdupdate.c b/common/cmd_sdupdate.c
+--- a/common/cmd_sdupdate.c
++++ b/common/cmd_sdupdate.c
+@@ -472,6 +472,7 @@
+ 	}
+ 
+ 	printf("SDU:   Successfully updated u-boot\n");
++	autoupdate_status = 1;
+ 	return 1;
+ }
+ 
