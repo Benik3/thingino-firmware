@@ -1,0 +1,40 @@
+From: Benik3 <benik333@gmail.com>
+Date: Sun, 27 Sep 2026 01:53:59 +0200
+Subject: [PATCH] mmc: jz: report read CRC errors the loop did not see
+
+jz_mmc_send_cmd checks MSC_STAT_CRC_READ_ERROR only at the top of its
+read loop, which it reaches only when the RX FIFO has run empty, and it
+leaves the loop as soon as DATA_TRAN_DONE is set. The CRC error of the
+last block comes with DATA_TRAN_DONE, so it was never seen. When the
+card fills the FIFO faster than the CPU empties it, as in 4-bit high
+speed mode, the loop does not get back to the top during the transfer
+at all, and a CRC error in any block was missed. Corrupt data then
+reached the caller as a good read.
+
+CRC_READ_ERROR stays set until the next command, so one check after
+DATA_TRAN_DONE catches an error in any block. On a model of the
+controller, a last-block error and a mid-transfer error with a full
+FIFO both came back as success before this change and as COMM_ERR
+after it; clean reads are unchanged.
+
+The SPL copy of the loop is not changed: it only runs when booting from
+an SD card.
+
+Signed-off-by: Benik3 <benik333@gmail.com>
+---
+ drivers/mmc/jz_mmc.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/mmc/jz_mmc.c b/drivers/mmc/jz_mmc.c
+--- a/drivers/mmc/jz_mmc.c
++++ b/drivers/mmc/jz_mmc.c
+@@ -185,6 +185,9 @@
+ 		} while (!(stat & MSC_STAT_DATA_TRAN_DONE));
+ 		while (!(jz_mmc_readl(priv, MSC_IFLG) & MSC_IREG_DATA_TRAN_DONE));
+ 		jz_mmc_writel(MSC_IREG_DATA_TRAN_DONE, priv, MSC_IFLG);
++		/* the loop sees CRC errors only when the FIFO runs empty */
++		if (jz_mmc_readl(priv, MSC_STAT) & MSC_STAT_CRC_READ_ERROR)
++			return COMM_ERR;
+ 	}
+ #else
+ 	if (data && (data->flags & MMC_DATA_READ)) {
